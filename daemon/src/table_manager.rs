@@ -133,6 +133,10 @@ pub(crate) struct TableManager {
     nexthop_invalid: ArcSwap<FnvHashSet<IpAddr>>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: ArcSwap<Vec<(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)>>,
+    /// Subscribers that want Adj-RIB-Out events (bmp_senders()). A BMP station monitoring only
+    /// Adj-RIB-In leaves itself out, so per-peer export does not clone every advertised path into
+    /// its queue (br-bgp: ~45M events for 2.66M paths over 10 iBGP peers).
+    adj_rib_out_subscribers: ArcSwap<FnvHashSet<SubscriptionId>>,
     vrfs: SharedVrfs,
     next_label: std::sync::atomic::AtomicU32,
 }
@@ -161,6 +165,7 @@ impl TableManager {
             nexthop_invalid: ArcSwap::new(Arc::new(FnvHashSet::default())),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
             subscribers: ArcSwap::new(Arc::new(Vec::new())),
+            adj_rib_out_subscribers: ArcSwap::new(Arc::new(FnvHashSet::default())),
             vrfs,
             next_label: std::sync::atomic::AtomicU32::new(Self::LABEL_BASE),
         }
@@ -741,6 +746,15 @@ impl TableManager {
     ///
     /// When `want_snapshot` is `false`, only live events are delivered.
     pub(crate) fn subscribe(&self, want_snapshot: bool) -> Subscription {
+        self.subscribe_filtered(want_snapshot, true)
+    }
+
+    /// subscribe() that can opt out of Adj-RIB-Out events.
+    pub(crate) fn subscribe_filtered(
+        &self,
+        want_snapshot: bool,
+        adj_rib_out: bool,
+    ) -> Subscription {
         let id = SubscriptionId(
             self.next_sub_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -753,6 +767,13 @@ impl TableManager {
             v.push((id, tx.clone()));
             Arc::new(v)
         });
+        if adj_rib_out {
+            self.adj_rib_out_subscribers.rcu(|cur| {
+                let mut s = (**cur).clone();
+                s.insert(id);
+                Arc::new(s)
+            });
+        }
         if want_snapshot {
             // Snapshot each shard while holding the lock.  Any insert_route() on a
             // shard that has not yet been snapshotted either:
@@ -799,6 +820,11 @@ impl TableManager {
     pub(crate) fn unsubscribe(&self, id: SubscriptionId) {
         self.subscribers
             .rcu(|cur| Arc::new(cur.iter().filter(|(i, _)| *i != id).cloned().collect()));
+        self.adj_rib_out_subscribers.rcu(|cur| {
+            let mut s = (**cur).clone();
+            s.remove(&id);
+            Arc::new(s)
+        });
     }
 
     pub(crate) fn peer_up(&self, data: PeerUpData) {
@@ -825,9 +851,11 @@ impl TableManager {
     /// Returns an empty Vec when no subscribers are registered, letting callers
     /// skip Adj-RIB-Out notification cheaply in the common (no-BMP) case.
     pub(crate) fn bmp_senders(&self) -> Vec<mpsc::UnboundedSender<BgpEvent>> {
+        let want = self.adj_rib_out_subscribers.load();
         self.subscribers
             .load()
             .iter()
+            .filter(|(id, _)| want.contains(id))
             .map(|(_, tx)| tx.clone())
             .collect()
     }

@@ -351,7 +351,7 @@ impl BmpClient {
 
         let mut snapshot: SnapshotMap = FnvHashMap::default();
         let mut snapshot_post: SnapshotMap = FnvHashMap::default();
-        let subscription = tables.subscribe(true);
+        let subscription = tables.subscribe_filtered(true, policy.want_adj_rib_out());
         let sub_id = subscription.id;
         let mut rx = UnboundedReceiverStream::new(subscription.rx);
 
