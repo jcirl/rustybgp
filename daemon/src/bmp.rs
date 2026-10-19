@@ -385,7 +385,7 @@ impl BmpClient {
         if policy.want_adj_rib_in() {
             for (addr, peer_header) in &established_peers {
                 for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header, 0) {
-                    if lines.send(&msg).await.is_err() {
+                    if lines.feed(&msg).await.is_err() {
                         tables.unsubscribe(sub_id);
                         return;
                     }
@@ -402,7 +402,7 @@ impl BmpClient {
                     &peer_header.clone().with_post_policy(),
                     bmp::Message::PEER_FLAG_POST_POLICY,
                 ) {
-                    if lines.send(&msg).await.is_err() {
+                    if lines.feed(&msg).await.is_err() {
                         tables.unsubscribe(sub_id);
                         return;
                     }
@@ -434,7 +434,7 @@ impl BmpClient {
                         timestamp: crate::proto::unix_secs(),
                     };
                     let msg = loc_rib_to_bmp(&lrc, local_id, local_asn);
-                    if lines.send(&msg).await.is_err() {
+                    if lines.feed(&msg).await.is_err() {
                         tables.unsubscribe(sub_id);
                         return;
                     }
@@ -466,6 +466,11 @@ impl BmpClient {
 
         // Live event loop.
         loop {
+            // br-bgp: messages are fed (encoded into the Framed buffer, which writes out as it fills) instead of
+            // sent (feed + flush per message); flush only when no more events are queued.
+            if rx.as_ref().is_empty() && lines.flush().await.is_err() {
+                break;
+            }
             tokio::select! {
                 msg = lines.next() => {
                     match msg {
@@ -481,7 +486,7 @@ impl BmpClient {
                             }
                             let update = adj_rib_in_to_bmp_update(&change);
                             if lines
-                                .send(&bmp::Message::RouteMonitoring {
+                                .feed(&bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
                                         0,
                                         change.source.remote_asn,
@@ -505,7 +510,7 @@ impl BmpClient {
                             }
                             let update = adj_rib_in_to_bmp_update(&change);
                             if lines
-                                .send(&bmp::Message::RouteMonitoring {
+                                .feed(&bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
                                         bmp::Message::PEER_FLAG_POST_POLICY,
                                         change.source.remote_asn,
@@ -529,7 +534,7 @@ impl BmpClient {
                             }
                             let update = adj_rib_out_to_bmp_update(&change);
                             if lines
-                                .send(&bmp::Message::RouteMonitoring {
+                                .feed(&bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
                                         bmp::Message::PEER_FLAG_ADJ_RIB_OUT,
                                         change.peer_asn,
@@ -553,7 +558,7 @@ impl BmpClient {
                             }
                             let update = adj_rib_out_to_bmp_update(&change);
                             if lines
-                                .send(&bmp::Message::RouteMonitoring {
+                                .feed(&bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
                                         bmp::Message::PEER_FLAG_ADJ_RIB_OUT
                                             | bmp::Message::PEER_FLAG_POST_POLICY,
@@ -578,7 +583,7 @@ impl BmpClient {
                             }
                             let local_asn = global.read().await.asn;
                             let msg = loc_rib_to_bmp(&change, local_id, local_asn);
-                            if lines.send(&msg).await.is_err() {
+                            if lines.feed(&msg).await.is_err() {
                                 break;
                             }
                         }
@@ -641,7 +646,20 @@ impl BmpClient {
         tables: TableHandle,
         policy: BmpPolicy,
     ) {
-        tokio::spawn(async move {
+        // br-bgp: run the station on its own OS thread and current-thread runtime. On the shared multi-thread
+        // runtime the shard workers kept it from running during a full-table ingest, so its unbounded subscription
+        // queue grew by ~300 MB/s until the process was OOM-killed (2.66M paths, pre+post monitoring).
+        let spawned = std::thread::Builder::new()
+            .name("bmp-sender".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        log::error!("bmp: runtime: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
             loop {
                 let stream = tokio::select! {
                     r = tokio::time::timeout(
@@ -686,7 +704,11 @@ impl BmpClient {
                     _ = cancel.cancelled() => return,
                 }
             }
-        });
+                });
+            });
+        if let Err(e) = spawned {
+            log::error!("bmp: thread: {e}");
+        }
     }
 }
 
